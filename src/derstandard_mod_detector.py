@@ -113,15 +113,45 @@ class _DashboardHandler(BaseHTTPRequestHandler):
   textarea {{ width: 100%; font-family: monospace; font-size: .9rem; padding: .5rem; }}
   button {{ margin-top: .5rem; padding: .4rem 1rem; }}
   a {{ color: #0366d6; }}
+  #history {{ margin-top: 1rem; }}
+  #history summary {{ cursor: pointer; color: #666; font-size: .85rem; }}
+  #history ul {{ list-style: none; padding: 0; margin: .5rem 0; }}
+  #history li {{ font-family: monospace; font-size: .85rem; padding: .25rem .4rem; cursor: pointer; border-bottom: 1px solid #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  #history li:hover {{ background: #e8f0fe; }}
 </style>
 </head><body>
 <h1>SQL Query</h1>
 <p class="meta"><a href="/">&larr; Dashboard</a></p>
-<form method="get" action="/sql">
-<textarea name="q" rows="3" placeholder="SELECT * FROM moderated_postings LIMIT 10">{safe_query}</textarea>
+<form id="sqlform" method="get" action="/sql">
+<textarea id="querybox" name="q" rows="3" placeholder="SELECT * FROM moderated_postings LIMIT 10">{safe_query}</textarea>
 <br><button type="submit">Run</button>
 </form>
+<details id="history"><summary>Query history</summary><ul id="hlist"></ul></details>
 {result_html}
+<script>
+(function() {{
+  var KEY = "sql_history", MAX = 30;
+  var h = JSON.parse(localStorage.getItem(KEY) || "[]");
+  var q = document.getElementById("querybox").value.trim();
+  if (q) {{
+    h = h.filter(function(x) {{ return x !== q; }});
+    h.unshift(q);
+    if (h.length > MAX) h = h.slice(0, MAX);
+    localStorage.setItem(KEY, JSON.stringify(h));
+  }}
+  var ul = document.getElementById("hlist");
+  h.forEach(function(item) {{
+    var li = document.createElement("li");
+    li.textContent = item;
+    li.onclick = function() {{
+      document.getElementById("querybox").value = item;
+      document.getElementById("sqlform").submit();
+    }};
+    ul.appendChild(li);
+  }});
+  if (h.length === 0) document.getElementById("history").style.display = "none";
+}})();
+</script>
 </body></html>"""
         self._send_html(page)
 
