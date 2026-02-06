@@ -320,7 +320,7 @@ def get_forum_info(article_url):
     return forum["id"], forum["totalPostingCount"]
 
 
-def collect_postings_from_node(node):
+def collect_postings_from_node(node, parent_id=""):
     """Recursively collect a posting and all its nested replies."""
     postings = {}
     upvotes = 0
@@ -337,11 +337,12 @@ def collect_postings_from_node(node):
         "text": node.get("text") or "",
         "created_at": node["history"]["created"],
         "root_posting_id": node.get("rootPostingId", ""),
+        "parent_posting_id": parent_id,
         "upvotes": upvotes,
         "downvotes": downvotes,
     }
     for reply in node.get("replies", []):
-        postings.update(collect_postings_from_node(reply))
+        postings.update(collect_postings_from_node(reply, parent_id=node["id"]))
     return postings
 
 
@@ -475,6 +476,10 @@ def init_db(db_path):
             downvotes INTEGER NOT NULL DEFAULT 0,
             thread_id TEXT NOT NULL DEFAULT '',
             article_title TEXT NOT NULL DEFAULT '',
+            parent_posting_id TEXT NOT NULL DEFAULT '',
+            parent_author TEXT NOT NULL DEFAULT '',
+            parent_title TEXT NOT NULL DEFAULT '',
+            parent_text TEXT NOT NULL DEFAULT '',
             UNIQUE(forum_id, posting_id)
         )
     """)
@@ -485,6 +490,10 @@ def init_db(db_path):
         ("downvotes", "INTEGER NOT NULL DEFAULT 0"),
         ("thread_id", "TEXT NOT NULL DEFAULT ''"),
         ("article_title", "TEXT NOT NULL DEFAULT ''"),
+        ("parent_posting_id", "TEXT NOT NULL DEFAULT ''"),
+        ("parent_author", "TEXT NOT NULL DEFAULT ''"),
+        ("parent_title", "TEXT NOT NULL DEFAULT ''"),
+        ("parent_text", "TEXT NOT NULL DEFAULT ''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE moderated_postings ADD COLUMN {col} {defn}")
@@ -523,13 +532,17 @@ def save_moderated(conn, forum_id, article_url, article_title, posting):
         root = posting.get("root_posting_id") or ""
         is_reply = 1 if root else 0
         thread_id = root if root else posting["id"]
+        parent_posting_id = posting.get("parent_posting_id", "")
+        parent_author = posting.get("parent_author", "")
+        parent_title = posting.get("parent_title", "")
+        parent_text = posting.get("parent_text", "")
         conn.execute(
             """INSERT OR IGNORE INTO moderated_postings
-               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes, thread_id, article_title)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes, thread_id, article_title, parent_posting_id, parent_author, parent_title, parent_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (forum_id, article_url, posting["id"], posting["author"],
              posting["title"], posting["text"], posting["created_at"], now, is_reply,
-             posting.get("upvotes", 0), posting.get("downvotes", 0), thread_id, article_title),
+             posting.get("upvotes", 0), posting.get("downvotes", 0), thread_id, article_title, parent_posting_id, parent_author, parent_title, parent_text),
         )
         conn.commit()
         return True
@@ -860,6 +873,13 @@ def main():
                             "id": pid, "author": "?", "title": "?",
                             "text": "?", "created_at": "?",
                         })
+                        parent_id = posting.get("parent_posting_id", "")
+                        if parent_id:
+                            parent = posting_cache.get(parent_id)
+                            if parent:
+                                posting["parent_author"] = parent.get("author", "")
+                                posting["parent_title"] = parent.get("title", "")
+                                posting["parent_text"] = parent.get("text", "")
                         saved = save_moderated(conn, forum_id, article_url, article_title, posting)
                         status = "saved" if saved else "already known"
                         log(f"    {pid} by {posting['author']}: {posting['title'][:50]} ({status})")
