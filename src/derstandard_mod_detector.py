@@ -330,6 +330,7 @@ def collect_postings_from_node(node, parent_id=""):
             upvotes = r["value"]
         elif r["name"] == "negative":
             downvotes = r["value"]
+    is_deleted = node.get("lifecycleStatus") == "Deleted"
     postings[node["id"]] = {
         "id": node["id"],
         "author": node["author"]["name"],
@@ -340,6 +341,7 @@ def collect_postings_from_node(node, parent_id=""):
         "parent_posting_id": parent_id,
         "upvotes": upvotes,
         "downvotes": downvotes,
+        "self_deleted": is_deleted,
     }
     for reply in node.get("replies", []):
         postings.update(collect_postings_from_node(reply, parent_id=node["id"]))
@@ -867,8 +869,15 @@ def main():
                     log(f"  +{len(added)} new postings")
 
                 if removed:
-                    log(f"  -{len(removed)} MODERATED postings:")
-                    for pid in removed:
+                    # Filter out self-deleted posts (lifecycleStatus: "Deleted")
+                    moderated = [pid for pid in removed
+                                 if not posting_cache.get(pid, {}).get("self_deleted")]
+                    self_deleted = len(removed) - len(moderated)
+                    if self_deleted:
+                        log(f"  {self_deleted} self-deleted posting(s) skipped")
+                    if moderated:
+                        log(f"  -{len(moderated)} MODERATED postings:")
+                    for pid in moderated:
                         posting = posting_cache.get(pid, {
                             "id": pid, "author": "?", "title": "?",
                             "text": "?", "created_at": "?",
