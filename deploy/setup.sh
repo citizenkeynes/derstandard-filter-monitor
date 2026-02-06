@@ -54,6 +54,9 @@ POLL_INTERVAL=120
 
 # Run RSS discovery every Nth poll cycle.
 DISCOVER_INTERVAL=5
+
+# Web dashboard port (0 to disable).
+WEB_PORT=8080
 CONF_EOF
     echo "    Created $CONF"
 else

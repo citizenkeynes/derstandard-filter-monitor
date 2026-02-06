@@ -16,6 +16,7 @@ ExecStart=/opt/derstandard-mod-detector/venv/bin/python \
     --max-inactive $MAX_INACTIVE \
     --interval $POLL_INTERVAL \
     --discover-interval $DISCOVER_INTERVAL \
+    --web-port $WEB_PORT \
     --db data/moderated_postings.db \
     $EXTRA_URLS
 Restart=on-failure
