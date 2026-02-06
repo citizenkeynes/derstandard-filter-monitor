@@ -444,6 +444,8 @@ def init_db(db_path):
             is_reply INTEGER NOT NULL DEFAULT 0,
             upvotes INTEGER NOT NULL DEFAULT 0,
             downvotes INTEGER NOT NULL DEFAULT 0,
+            thread_id TEXT NOT NULL DEFAULT '',
+            article_title TEXT NOT NULL DEFAULT '',
             UNIQUE(forum_id, posting_id)
         )
     """)
@@ -452,6 +454,8 @@ def init_db(db_path):
         ("is_reply", "INTEGER NOT NULL DEFAULT 0"),
         ("upvotes", "INTEGER NOT NULL DEFAULT 0"),
         ("downvotes", "INTEGER NOT NULL DEFAULT 0"),
+        ("thread_id", "TEXT NOT NULL DEFAULT ''"),
+        ("article_title", "TEXT NOT NULL DEFAULT ''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE moderated_postings ADD COLUMN {col} {defn}")
@@ -461,18 +465,20 @@ def init_db(db_path):
     return conn
 
 
-def save_moderated(conn, forum_id, article_url, posting):
+def save_moderated(conn, forum_id, article_url, article_title, posting):
     """Save a moderated posting to the database."""
     now = datetime.now(timezone.utc).isoformat()
     try:
-        is_reply = 1 if posting.get("root_posting_id") else 0
+        root = posting.get("root_posting_id") or ""
+        is_reply = 1 if root else 0
+        thread_id = root if root else posting["id"]
         conn.execute(
             """INSERT OR IGNORE INTO moderated_postings
-               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes, thread_id, article_title)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (forum_id, article_url, posting["id"], posting["author"],
              posting["title"], posting["text"], posting["created_at"], now, is_reply,
-             posting.get("upvotes", 0), posting.get("downvotes", 0)),
+             posting.get("upvotes", 0), posting.get("downvotes", 0), thread_id, article_title),
         )
         conn.commit()
         return True
@@ -748,6 +754,7 @@ def main():
 
         for forum_id in list(forums):
             article_url = forums[forum_id]["url"]
+            article_title = forums[forum_id].get("title", "")
             try:
                 current = fetch_all_postings(forum_id)
             except Exception as e:
@@ -780,7 +787,7 @@ def main():
                             "id": pid, "author": "?", "title": "?",
                             "text": "?", "created_at": "?",
                         })
-                        saved = save_moderated(conn, forum_id, article_url, posting)
+                        saved = save_moderated(conn, forum_id, article_url, article_title, posting)
                         status = "saved" if saved else "already known"
                         log(f"    {pid} by {posting['author']}: {posting['title'][:50]} ({status})")
                 elif not added:
