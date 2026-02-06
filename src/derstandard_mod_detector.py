@@ -37,8 +37,7 @@ HEADERS = {
 # Shared state for the web dashboard thread to read.
 _shared = {"forums": {}, "snapshots": {}, "db_path": ""}
 
-# Track when we last posted to Reddit (prevents double-posting within a day).
-_last_post_date = None
+# Track when we last posted to Reddit (persisted in DB to survive restarts).
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
@@ -491,8 +490,30 @@ def init_db(db_path):
             conn.execute(f"ALTER TABLE moderated_postings ADD COLUMN {col} {defn}")
         except sqlite3.OperationalError:
             pass  # Column already exists.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
     return conn
+
+
+def get_meta(db_path, key):
+    """Read a value from the metadata table."""
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_meta(db_path, key, value):
+    """Write a value to the metadata table."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
 
 
 def save_moderated(conn, forum_id, article_url, article_title, posting):
@@ -539,9 +560,9 @@ def get_daily_stats(db_path, since_hours=24):
         conn.close()
         return None
 
-    # Per-article breakdown
+    # Per-article breakdown (by title, drop URL)
     articles = conn.execute(
-        "SELECT article_url, COUNT(*) AS cnt, SUM(upvotes), SUM(downvotes)"
+        "SELECT article_title, COUNT(*) AS cnt, SUM(upvotes), SUM(downvotes)"
         " FROM moderated_postings WHERE moderated_at >= ?"
         " GROUP BY article_url ORDER BY cnt DESC",
         (cutoff,),
@@ -560,6 +581,18 @@ def get_daily_stats(db_path, since_hours=24):
         "SELECT COUNT(*) FROM moderated_postings WHERE moderated_at >= ? AND is_reply = 1",
         (cutoff,),
     ).fetchone()[0]
+
+    # Actual posts from the most moderated article (for pattern analysis)
+    top_article_posts = []
+    if articles:
+        top_title = articles[0][0]
+        top_article_posts = conn.execute(
+            "SELECT author, title, text, is_reply, upvotes, downvotes"
+            " FROM moderated_postings WHERE moderated_at >= ? AND article_title = ?"
+            " ORDER BY created_at",
+            (cutoff, top_title),
+        ).fetchall()
+
     conn.close()
 
     root_count = total - reply_count
@@ -569,12 +602,21 @@ def get_daily_stats(db_path, since_hours=24):
     lines.append(f"Replies moderated: {reply_count}")
     lines.append("")
     lines.append("Per-article breakdown:")
-    for url, cnt, up, down in articles:
-        lines.append(f"  {url} — {cnt} moderated (upvotes: {up}, downvotes: {down})")
+    for title, cnt, up, down in articles:
+        label = title or "(unknown title)"
+        lines.append(f"  {label} — {cnt} moderated (upvotes: {up}, downvotes: {down})")
     lines.append("")
     lines.append("Top moderated authors:")
     for author, cnt in authors:
         lines.append(f"  {author}: {cnt}")
+
+    if top_article_posts:
+        top_label = articles[0][0] or "(unknown title)"
+        lines.append("")
+        lines.append(f"Moderated posts from top article ({top_label}):")
+        for author, title, text, is_reply, up, down in top_article_posts:
+            kind = "reply" if is_reply else "root"
+            lines.append(f"  [{kind}] {author}: {text} (upvotes: {up}, downvotes: {down})")
 
     return "\n".join(lines)
 
@@ -668,7 +710,8 @@ def post_daily_summary(args, db_path):
         )
     prompt += (
         "Write a concise Reddit post (2-3 paragraphs) in English that:\n"
-        "- Summarizes the key numbers (total moderated, busiest articles)\n"
+        "- Summarizes the key numbers (total moderated, busiest articles by title)\n"
+        "- Analyzes patterns in the actual moderated posts from the top article (common themes, tone, why they may have been removed)\n"
         "- Notes any interesting patterns (e.g. which topics got heavy moderation)\n"
         "- Briefly compares today's activity to the 7-day trend if notable\n"
         "- Keeps a neutral, informative tone\n"
@@ -761,15 +804,15 @@ def main():
         cycle += 1
         log(f"--- Poll cycle {cycle} ---")
 
-        # Daily Reddit summary
-        global _last_post_date
+        # Daily Reddit summary (persisted in DB to survive restarts)
         now_utc = datetime.now(timezone.utc)
+        last_post = get_meta(args.db, "last_post_date")
         if (args.reddit_client_id
-                and _last_post_date != now_utc.date()
+                and last_post != str(now_utc.date())
                 and now_utc.hour >= args.post_hour):
             try:
                 post_daily_summary(args, args.db)
-                _last_post_date = now_utc.date()
+                set_meta(args.db, "last_post_date", now_utc.date())
                 log("Daily Reddit post published")
             except Exception as e:
                 log(f"Daily Reddit post failed: {e}")
