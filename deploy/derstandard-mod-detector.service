@@ -1,0 +1,35 @@
+[Unit]
+Description=DerStandard Forum Moderation Detector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moddetector
+Group=moddetector
+WorkingDirectory=/opt/derstandard-mod-detector
+EnvironmentFile=/etc/derstandard-mod-detector.conf
+ExecStart=/opt/derstandard-mod-detector/venv/bin/python \
+    src/derstandard_mod_detector.py \
+    --discover \
+    --min-posts $MIN_POSTS \
+    --max-inactive $MAX_INACTIVE \
+    --interval $POLL_INTERVAL \
+    --discover-interval $DISCOVER_INTERVAL \
+    --db data/moderated_postings.db \
+    $EXTRA_URLS
+Restart=on-failure
+RestartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=derstandard-mod-detector
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/derstandard-mod-detector/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+[project]
+name = "derstandard-mod-detector"
+version = "0.1.0"
+description = "Detect moderated (removed) forum postings on derstandard.at"
+requires-python = ">= 3.8"
