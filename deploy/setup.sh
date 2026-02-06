@@ -50,7 +50,7 @@ MIN_POSTS=50
 MAX_INACTIVE=60
 
 # Poll interval in seconds.
-POLL_INTERVAL=120
+POLL_INTERVAL=240
 
 # Run RSS discovery every Nth poll cycle.
 DISCOVER_INTERVAL=5

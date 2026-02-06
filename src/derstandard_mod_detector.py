@@ -135,7 +135,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             ):
                 mod_counts[row[0]] = row[1]
             for row in conn.execute(
-                "SELECT article_url, posting_id, author, title, text, created_at, moderated_at"
+                "SELECT article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes"
                 " FROM moderated_postings ORDER BY moderated_at DESC LIMIT 100"
             ):
                 recent_moderated.append(row)
@@ -177,7 +177,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
 
         recent_rows = ""
-        for art_url, pid, author, title, text, created, moderated_at in recent_moderated:
+        for art_url, pid, author, title, text, created, moderated_at, is_reply, upvotes, downvotes in recent_moderated:
             safe_author = html_mod.escape(author or "")
             safe_title = html_mod.escape(title or "")
             safe_text = html_mod.escape(text or "")
@@ -194,11 +194,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     mod_age = f"{delta // 3600}h {(delta % 3600) // 60}m ago"
             except (ValueError, TypeError):
                 mod_age = moderated_at or "\u2014"
+            reply_marker = "yes" if is_reply else ""
             recent_rows += (
                 f"<tr><td>{safe_author}</td>"
                 f"<td class=\"truncate\" title=\"{safe_title}\">{safe_title}</td>"
                 f"<td class=\"truncate\" title=\"{safe_text}\">{safe_text}</td>"
                 f"<td><a href=\"{art_url}\">{art_label}</a></td>"
+                f"<td>{reply_marker}</td>"
+                f"<td>+{upvotes}/&minus;{downvotes}</td>"
                 f"<td>{mod_age}</td></tr>\n"
             )
 
@@ -206,7 +209,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 <html><head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="60">
-<title>Mod Detector Dashboard</title>
+<title>derStandard Moderation Dashboard</title>
 <style>
   body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #f8f8f8; }}
   h1 {{ font-size: 1.3rem; }}
@@ -219,14 +222,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
   .truncate {{ max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 </style>
 </head><body>
-<h1>Mod Detector Dashboard</h1>
+<h1>derStandard Moderation Dashboard</h1>
 <p class="meta">Monitoring {len(forums)} forum(s) &middot; page refreshes every 60 s &middot; <a href="/sql">SQL</a></p>
 <table>
 <tr><th>Article</th><th>Postings</th><th>Moderated</th><th>Last Activity</th></tr>
 {table_rows}</table>
 <h2>Last 100 Filtered Posts</h2>
 <table>
-<tr><th>Author</th><th>Title</th><th>Text</th><th>Article</th><th>Filtered</th></tr>
+<tr><th>Author</th><th>Title</th><th>Text</th><th>Article</th><th>Reply</th><th>Votes</th><th>Filtered</th></tr>
 {recent_rows}</table>
 </body></html>"""
 
@@ -286,6 +289,13 @@ def get_forum_info(article_url):
 def collect_postings_from_node(node):
     """Recursively collect a posting and all its nested replies."""
     postings = {}
+    upvotes = 0
+    downvotes = 0
+    for r in (node.get("reactions") or {}).get("aggregated", []):
+        if r["name"] == "positive":
+            upvotes = r["value"]
+        elif r["name"] == "negative":
+            downvotes = r["value"]
     postings[node["id"]] = {
         "id": node["id"],
         "author": node["author"]["name"],
@@ -293,6 +303,8 @@ def collect_postings_from_node(node):
         "text": node.get("text") or "",
         "created_at": node["history"]["created"],
         "root_posting_id": node.get("rootPostingId", ""),
+        "upvotes": upvotes,
+        "downvotes": downvotes,
     }
     for reply in node.get("replies", []):
         postings.update(collect_postings_from_node(reply))
@@ -424,9 +436,22 @@ def init_db(db_path):
             text TEXT,
             created_at TEXT,
             moderated_at TEXT NOT NULL,
+            is_reply INTEGER NOT NULL DEFAULT 0,
+            upvotes INTEGER NOT NULL DEFAULT 0,
+            downvotes INTEGER NOT NULL DEFAULT 0,
             UNIQUE(forum_id, posting_id)
         )
     """)
+    # Migrate existing databases that lack new columns.
+    for col, defn in [
+        ("is_reply", "INTEGER NOT NULL DEFAULT 0"),
+        ("upvotes", "INTEGER NOT NULL DEFAULT 0"),
+        ("downvotes", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE moderated_postings ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists.
     conn.commit()
     return conn
 
@@ -435,12 +460,14 @@ def save_moderated(conn, forum_id, article_url, posting):
     """Save a moderated posting to the database."""
     now = datetime.now(timezone.utc).isoformat()
     try:
+        is_reply = 1 if posting.get("root_posting_id") else 0
         conn.execute(
             """INSERT OR IGNORE INTO moderated_postings
-               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (forum_id, article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (forum_id, article_url, posting["id"], posting["author"],
-             posting["title"], posting["text"], posting["created_at"], now),
+             posting["title"], posting["text"], posting["created_at"], now, is_reply,
+             posting.get("upvotes", 0), posting.get("downvotes", 0)),
         )
         conn.commit()
         return True
@@ -456,7 +483,7 @@ def log(msg):
 def main():
     parser = argparse.ArgumentParser(description="Detect moderated postings on derstandard.at")
     parser.add_argument("urls", nargs="*", default=[], help="Article URLs to monitor")
-    parser.add_argument("--interval", type=int, default=120, help="Poll interval in seconds (default: 120)")
+    parser.add_argument("--interval", type=int, default=240, help="Poll interval in seconds (default: 240)")
     parser.add_argument("--db", default="data/moderated_postings.db", help="SQLite database path")
     parser.add_argument("--discover", action="store_true", help="Enable RSS auto-discovery of articles")
     parser.add_argument("--min-posts", type=int, default=50, help="Minimum postings to monitor a discovered article (default: 50)")
