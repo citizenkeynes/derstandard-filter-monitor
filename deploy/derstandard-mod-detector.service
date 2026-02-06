@@ -18,6 +18,13 @@ ExecStart=/opt/derstandard-mod-detector/venv/bin/python \
     --discover-interval $DISCOVER_INTERVAL \
     --web-port $WEB_PORT \
     --db data/moderated_postings.db \
+    --reddit-client-id $REDDIT_CLIENT_ID \
+    --reddit-client-secret $REDDIT_CLIENT_SECRET \
+    --reddit-username $REDDIT_USERNAME \
+    --reddit-password $REDDIT_PASSWORD \
+    --reddit-subreddit $REDDIT_SUBREDDIT \
+    --gemini-api-key $GEMINI_API_KEY \
+    --post-hour $POST_HOUR \
     $EXTRA_URLS
 Restart=on-failure
 RestartSec=30

@@ -57,6 +57,15 @@ DISCOVER_INTERVAL=5
 
 # Web dashboard port (0 to disable).
 WEB_PORT=8080
+
+# Daily Reddit summary (leave empty to disable).
+REDDIT_CLIENT_ID=
+REDDIT_CLIENT_SECRET=
+REDDIT_USERNAME=
+REDDIT_PASSWORD=
+REDDIT_SUBREDDIT=
+GEMINI_API_KEY=
+POST_HOUR=7
 CONF_EOF
     echo "    Created $CONF"
 else

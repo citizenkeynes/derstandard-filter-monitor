@@ -8,7 +8,9 @@ Usage:
 """
 
 import argparse
+import base64
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -17,7 +19,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 API_URL = "https://capi.ds.at/forum-serve-graphql/v1/"
@@ -34,6 +36,9 @@ HEADERS = {
 
 # Shared state for the web dashboard thread to read.
 _shared = {"forums": {}, "snapshots": {}, "db_path": ""}
+
+# Track when we last posted to Reddit (prevents double-posting within a day).
+_last_post_date = None
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
@@ -480,6 +485,176 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
+def get_daily_stats(db_path, since_hours=24):
+    """Query SQLite for moderation stats over the last `since_hours` hours.
+
+    Returns a formatted string suitable for inclusion in a Gemini prompt.
+    Returns None if there were no moderated posts in the period.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
+    conn = sqlite3.connect(db_path)
+
+    # Total moderated count
+    total = conn.execute(
+        "SELECT COUNT(*) FROM moderated_postings WHERE moderated_at >= ?", (cutoff,)
+    ).fetchone()[0]
+
+    if total == 0:
+        conn.close()
+        return None
+
+    # Per-article breakdown
+    articles = conn.execute(
+        "SELECT article_url, COUNT(*) AS cnt, SUM(upvotes), SUM(downvotes)"
+        " FROM moderated_postings WHERE moderated_at >= ?"
+        " GROUP BY article_url ORDER BY cnt DESC",
+        (cutoff,),
+    ).fetchall()
+
+    # Top 10 moderated authors
+    authors = conn.execute(
+        "SELECT author, COUNT(*) AS cnt"
+        " FROM moderated_postings WHERE moderated_at >= ?"
+        " GROUP BY author ORDER BY cnt DESC LIMIT 10",
+        (cutoff,),
+    ).fetchall()
+
+    # Reply vs root post ratio
+    reply_count = conn.execute(
+        "SELECT COUNT(*) FROM moderated_postings WHERE moderated_at >= ? AND is_reply = 1",
+        (cutoff,),
+    ).fetchone()[0]
+    conn.close()
+
+    root_count = total - reply_count
+
+    lines = [f"Total moderated posts: {total}"]
+    lines.append(f"Root posts moderated: {root_count}")
+    lines.append(f"Replies moderated: {reply_count}")
+    lines.append("")
+    lines.append("Per-article breakdown:")
+    for url, cnt, up, down in articles:
+        lines.append(f"  {url} — {cnt} moderated (upvotes: {up}, downvotes: {down})")
+    lines.append("")
+    lines.append("Top moderated authors:")
+    for author, cnt in authors:
+        lines.append(f"  {author}: {cnt}")
+
+    return "\n".join(lines)
+
+
+def gemini_generate(api_key, prompt):
+    """Call the Gemini API to generate text from a prompt."""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def reddit_get_token(client_id, client_secret, username, password):
+    """Obtain a Reddit OAuth access token via the password grant flow."""
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    body = urllib.parse.urlencode({
+        "grant_type": "password",
+        "username": username,
+        "password": password,
+    }).encode()
+    req = urllib.request.Request(
+        "https://www.reddit.com/api/v1/access_token",
+        data=body,
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "User-Agent": "derstandard-mod-detector/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    if "access_token" not in data:
+        raise RuntimeError(f"Reddit auth failed: {data}")
+    return data["access_token"]
+
+
+def reddit_submit(access_token, subreddit, title, body_text):
+    """Submit a self-post to a subreddit."""
+    body = urllib.parse.urlencode({
+        "sr": subreddit,
+        "kind": "self",
+        "title": title,
+        "text": body_text,
+        "api_type": "json",
+    }).encode()
+    req = urllib.request.Request(
+        "https://oauth.reddit.com/api/submit",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "derstandard-mod-detector/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    errors = data.get("json", {}).get("errors", [])
+    if errors:
+        raise RuntimeError(f"Reddit submit errors: {errors}")
+    return data.get("json", {}).get("data", {}).get("url", "")
+
+
+def post_daily_summary(args, db_path):
+    """Orchestrate: query stats -> Gemini analysis -> Reddit post."""
+    stats = get_daily_stats(db_path)
+    if stats is None:
+        log("Daily summary: no moderated posts in the last 24h, skipping")
+        return
+
+    weekly_stats = get_daily_stats(db_path, since_hours=168)
+
+    prompt = (
+        "You are summarizing daily moderation activity on derstandard.at, an Austrian news site.\n"
+        "Here are the stats for the last 24 hours:\n\n"
+        f"{stats}\n\n"
+    )
+    if weekly_stats:
+        prompt += (
+            "For context, here are the cumulative stats for the previous 7 days:\n\n"
+            f"{weekly_stats}\n\n"
+        )
+    prompt += (
+        "Write a concise Reddit post (2-3 paragraphs) in English that:\n"
+        "- Summarizes the key numbers (total moderated, busiest articles)\n"
+        "- Notes any interesting patterns (e.g. which topics got heavy moderation)\n"
+        "- Briefly compares today's activity to the 7-day trend if notable\n"
+        "- Keeps a neutral, informative tone\n"
+        "- Uses Reddit markdown formatting\n\n"
+        "Do not include a title — just the body text."
+    )
+
+    log("Daily summary: generating analysis via Gemini...")
+    body_text = gemini_generate(args.gemini_api_key, prompt)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title = f"derstandard.at Moderation Summary — {today}"
+
+    log("Daily summary: posting to Reddit...")
+    token = reddit_get_token(
+        args.reddit_client_id, args.reddit_client_secret,
+        args.reddit_username, args.reddit_password,
+    )
+    post_url = reddit_submit(token, args.reddit_subreddit, title, body_text)
+    log(f"Daily summary: posted to Reddit — {post_url}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Detect moderated postings on derstandard.at")
     parser.add_argument("urls", nargs="*", default=[], help="Article URLs to monitor")
@@ -490,6 +665,13 @@ def main():
     parser.add_argument("--max-inactive", type=int, default=60, help="Drop forums with no new post in this many minutes (default: 60)")
     parser.add_argument("--discover-interval", type=int, default=5, help="Run discovery every Nth poll cycle (default: 5)")
     parser.add_argument("--web-port", type=int, default=8080, help="Web dashboard port (default: 8080, 0 to disable)")
+    parser.add_argument("--reddit-client-id", default=os.environ.get("REDDIT_CLIENT_ID", ""), help="Reddit app client ID (empty = disable posting)")
+    parser.add_argument("--reddit-client-secret", default=os.environ.get("REDDIT_CLIENT_SECRET", ""), help="Reddit app client secret")
+    parser.add_argument("--reddit-username", default=os.environ.get("REDDIT_USERNAME", ""), help="Reddit account username")
+    parser.add_argument("--reddit-password", default=os.environ.get("REDDIT_PASSWORD", ""), help="Reddit account password")
+    parser.add_argument("--reddit-subreddit", default=os.environ.get("REDDIT_SUBREDDIT", ""), help="Target subreddit name (no r/ prefix)")
+    parser.add_argument("--gemini-api-key", default=os.environ.get("GEMINI_API_KEY", ""), help="Google Gemini API key")
+    parser.add_argument("--post-hour", type=int, default=int(os.environ.get("POST_HOUR", "7")), help="UTC hour to post daily summary (default: 7)")
     args = parser.parse_args()
 
     if not args.urls and not args.discover:
@@ -542,6 +724,19 @@ def main():
     while True:
         cycle += 1
         log(f"--- Poll cycle {cycle} ---")
+
+        # Daily Reddit summary
+        global _last_post_date
+        now_utc = datetime.now(timezone.utc)
+        if (args.reddit_client_id
+                and _last_post_date != now_utc.date()
+                and now_utc.hour >= args.post_hour):
+            try:
+                post_daily_summary(args, args.db)
+                _last_post_date = now_utc.date()
+                log("Daily Reddit post published")
+            except Exception as e:
+                log(f"Daily Reddit post failed: {e}")
 
         # Periodic discovery
         if args.discover and cycle > 1 and (cycle % args.discover_interval == 0):
