@@ -57,6 +57,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return self._handle_dashboard()
         if parsed.path == "/sql":
             return self._handle_sql(parsed)
+        if parsed.path == "/article":
+            return self._handle_article(parsed)
         self.send_error(404)
 
     def _handle_sql(self, parsed):
@@ -154,6 +156,130 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 </body></html>"""
         self._send_html(page)
 
+    def _handle_article(self, parsed):
+        import html as html_mod
+        qs = urllib.parse.parse_qs(parsed.query)
+        article_url = qs.get("url", [""])[0]
+        if not article_url:
+            self.send_error(400, "Missing url parameter")
+            return
+
+        db_path = _shared["db_path"]
+        now = datetime.now(timezone.utc)
+
+        # Fetch all postings for this article, grouped by thread, threads ordered
+        # by max moderated_at desc, postings within thread by created_at asc.
+        threads = {}  # thread_id -> {"max_mod": str, "posts": []}
+        article_title = ""
+        try:
+            conn = sqlite3.connect(db_path)
+            for row in conn.execute(
+                "SELECT posting_id, author, title, text, created_at, moderated_at,"
+                " is_reply, upvotes, downvotes, thread_id, article_title,"
+                " parent_author, parent_title, parent_text"
+                " FROM moderated_postings WHERE article_url = ?"
+                " ORDER BY created_at ASC",
+                (article_url,),
+            ):
+                (pid, author, title, text, created, mod_at, is_reply,
+                 up, down, tid, art_title, p_author, p_title, p_text) = row
+                if art_title:
+                    article_title = art_title
+                if tid not in threads:
+                    threads[tid] = {"max_mod": mod_at, "posts": []}
+                if mod_at > threads[tid]["max_mod"]:
+                    threads[tid]["max_mod"] = mod_at
+                threads[tid]["posts"].append({
+                    "pid": pid, "author": author, "title": title, "text": text,
+                    "created": created, "mod_at": mod_at, "is_reply": is_reply,
+                    "up": up, "down": down, "p_author": p_author,
+                    "p_title": p_title, "p_text": p_text,
+                })
+            conn.close()
+        except Exception:
+            pass
+
+        # Sort threads by max moderation timestamp descending.
+        sorted_threads = sorted(threads.items(), key=lambda t: t[1]["max_mod"], reverse=True)
+
+        total = sum(len(t["posts"]) for _, t in sorted_threads)
+        safe_title = html_mod.escape(article_title) if article_title else html_mod.escape(article_url)
+
+        def _relative(ts):
+            try:
+                dt = datetime.fromisoformat(ts)
+                delta = int((now - dt).total_seconds())
+                if delta < 60:
+                    return f"{delta}s ago"
+                if delta < 3600:
+                    return f"{delta // 60}m ago"
+                if delta < 86400:
+                    return f"{delta // 3600}h {(delta % 3600) // 60}m ago"
+                return f"{delta // 86400}d ago"
+            except (ValueError, TypeError):
+                return ts or "\u2014"
+
+        def _abs_time(ts):
+            try:
+                dt = datetime.fromisoformat(ts)
+                return dt.strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                return ts or ""
+
+        thread_html = ""
+        for tid, tdata in sorted_threads:
+            posts = tdata["posts"]
+            thread_html += f'<div class="thread">'
+            thread_html += f'<div class="thread-hdr">Thread {html_mod.escape(tid)} &mdash; {len(posts)} filtered post(s), latest filtered {_relative(tdata["max_mod"])}</div>'
+            for p in posts:
+                safe_author = html_mod.escape(p["author"] or "")
+                safe_ptitle = html_mod.escape(p["title"] or "")
+                safe_text = html_mod.escape(p["text"] or "")
+                reply_cls = " reply" if p["is_reply"] else ""
+                parent_html = ""
+                if p["is_reply"] and (p["p_author"] or p["p_text"]):
+                    pa = html_mod.escape(p["p_author"] or "?")
+                    pt = html_mod.escape(p["p_text"] or "")
+                    parent_html = f'<div class="parent">replying to <b>{pa}</b>: {pt}</div>'
+                thread_html += (
+                    f'<div class="post{reply_cls}">'
+                    f'{parent_html}'
+                    f'<div class="post-meta"><b>{safe_author}</b> &middot; '
+                    f'{_abs_time(p["created"])} &middot; '
+                    f'+{p["up"]}/&minus;{p["down"]} &middot; '
+                    f'filtered {_relative(p["mod_at"])}</div>'
+                )
+                if safe_ptitle:
+                    thread_html += f'<div class="post-title">{safe_ptitle}</div>'
+                thread_html += f'<div class="post-text">{safe_text}</div></div>'
+            thread_html += '</div>'
+
+        page = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>{safe_title} — Mod Detector</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #f8f8f8; }}
+  h1 {{ font-size: 1.3rem; }}
+  a {{ color: #0366d6; }}
+  .meta {{ color: #666; font-size: .85rem; margin-bottom: 1rem; }}
+  .thread {{ background: #fff; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1.2rem; overflow: hidden; }}
+  .thread-hdr {{ background: #333; color: #fff; padding: .5rem .75rem; font-size: .85rem; }}
+  .post {{ padding: .6rem .75rem; border-bottom: 1px solid #eee; }}
+  .post:last-child {{ border-bottom: none; }}
+  .post.reply {{ padding-left: 2rem; }}
+  .post-meta {{ font-size: .8rem; color: #666; margin-bottom: .25rem; }}
+  .post-title {{ font-weight: 600; margin-bottom: .15rem; }}
+  .post-text {{ font-size: .95rem; white-space: pre-wrap; }}
+  .parent {{ font-size: .8rem; color: #888; border-left: 3px solid #ddd; padding: .25rem .5rem; margin-bottom: .4rem; background: #fafafa; }}
+</style>
+</head><body>
+<h1>{safe_title}</h1>
+<p class="meta"><a href="/">&larr; Dashboard</a> &middot; <a href="{html_mod.escape(article_url)}">Open on derstandard.at</a> &middot; {total} filtered post(s) in {len(sorted_threads)} thread(s)</p>
+{thread_html}
+</body></html>"""
+        self._send_html(page)
+
     def _handle_dashboard(self):
         forums = _shared["forums"]
         snapshots = _shared["snapshots"]
@@ -205,8 +331,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         table_rows = ""
         for url, title, postings, moderated, age in rows:
             label = html_mod.escape(title) if title else url
+            detail_url = f"/article?url={urllib.parse.quote(url, safe='')}"
             table_rows += (
-                f"<tr><td><a href=\"{url}\">{label}</a></td>"
+                f"<tr><td><a href=\"{detail_url}\">{label}</a></td>"
                 f"<td>{postings}</td><td>{moderated}</td><td>{age}</td></tr>\n"
             )
 
