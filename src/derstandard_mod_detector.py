@@ -453,8 +453,8 @@ document.querySelectorAll('table.sortable').forEach(table => {{
         const cellA = a.children[colIdx], cellB = b.children[colIdx];
         let va = cellA.dataset.sort !== undefined ? cellA.dataset.sort : cellA.textContent.trim();
         let vb = cellB.dataset.sort !== undefined ? cellB.dataset.sort : cellB.textContent.trim();
-        const na = parseFloat(va), nb = parseFloat(vb);
-        if (!isNaN(na) && !isNaN(nb)) return ascending ? na - nb : nb - na;
+        const isNum = s => /^-?\d+(\.\d+)?$/.test(s);
+        if (isNum(va) && isNum(vb)) {{ const d = parseFloat(va) - parseFloat(vb); return ascending ? d : -d; }}
         return ascending ? va.localeCompare(vb) : vb.localeCompare(va);
       }});
       rows.forEach(r => tbody.appendChild(r));
