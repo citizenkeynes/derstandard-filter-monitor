@@ -327,7 +327,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             else:
                 age = "\u2014"
             last_mod = mod_last.get(url, "")
-            rows.append((url, title, postings, moderated, age, last_mod))
+            if moderated > 0:
+                rows.append((url, title, postings, moderated, age, last_mod))
 
         rows.sort(key=lambda r: r[5], reverse=True)
 
@@ -656,6 +657,27 @@ def newest_posting_time(postings):
     return newest
 
 
+# Adaptive polling tiers: (max_inactivity_minutes, poll_interval_seconds, label)
+_POLL_TIERS = [
+    (60,   240,  "4m"),
+    (240,  900,  "15m"),
+    (720,  1800, "30m"),
+    (1440, 3600, "60m"),
+]
+
+
+def poll_interval_for(forum_info):
+    """Return (interval_seconds, label) based on how long a forum has been inactive."""
+    last = forum_info.get("last_activity")
+    if last is None:
+        return 240, "4m"
+    age_minutes = (datetime.now(timezone.utc) - last).total_seconds() / 60
+    for max_age, interval, label in _POLL_TIERS:
+        if age_minutes < max_age:
+            return interval, label
+    return 3600, "60m"
+
+
 def init_db(db_path):
     """Initialize the SQLite database."""
     conn = sqlite3.connect(db_path)
@@ -953,7 +975,7 @@ def main():
     parser.add_argument("--db", default="data/moderated_postings.db", help="SQLite database path")
     parser.add_argument("--discover", action="store_true", help="Enable RSS auto-discovery of articles")
     parser.add_argument("--min-posts", type=int, default=50, help="Minimum postings to monitor a discovered article (default: 50)")
-    parser.add_argument("--max-inactive", type=int, default=60, help="Drop forums with no new post in this many minutes (default: 60)")
+    parser.add_argument("--max-inactive", type=int, default=1440, help="Drop forums with no new post in this many minutes (default: 1440)")
     parser.add_argument("--discover-interval", type=int, default=5, help="Run discovery every Nth poll cycle (default: 5)")
     parser.add_argument("--web-port", type=int, default=8080, help="Web dashboard port (default: 8080, 0 to disable)")
     parser.add_argument("--reddit-client-id", default=os.environ.get("REDDIT_CLIENT_ID", ""), help="Reddit app client ID (empty = disable posting)")
@@ -1037,9 +1059,18 @@ def main():
             if new:
                 log(f"  {len(new)} new forum(s) discovered")
 
+        polled = 0
+        skipped = 0
         for forum_id in list(forums):
-            article_url = forums[forum_id]["url"]
-            article_title = forums[forum_id].get("title", "")
+            info = forums[forum_id]
+            # Adaptive polling: skip forums not yet due
+            if info.get("next_poll_at") and now_utc < info["next_poll_at"]:
+                skipped += 1
+                continue
+
+            polled += 1
+            article_url = info["url"]
+            article_title = info.get("title", "")
             try:
                 current = fetch_all_postings(forum_id)
             except Exception as e:
@@ -1047,12 +1078,17 @@ def main():
                 continue
 
             current_ids = set(current.keys())
-            log(f"  {article_url}: {len(current_ids)} postings")
 
             # Update last_activity from newest posting
             newest = newest_posting_time(current)
             if newest is not None:
                 forums[forum_id]["last_activity"] = newest
+
+            # Set next poll time based on inactivity tier
+            interval, tier_label = poll_interval_for(forums[forum_id])
+            forums[forum_id]["next_poll_at"] = now_utc + timedelta(seconds=interval)
+
+            log(f"  {article_url}: {len(current_ids)} postings (next poll in {tier_label})")
 
             # Update cache with latest data
             posting_cache.update(current)
@@ -1096,6 +1132,9 @@ def main():
                 log(f"  Initial snapshot captured")
 
             snapshots[forum_id] = current
+
+        if skipped:
+            log(f"  ({skipped} forum(s) deferred, {polled} polled)")
 
         # Update shared state for the web dashboard.
         _shared["forums"] = dict(forums)
