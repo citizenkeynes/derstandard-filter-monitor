@@ -287,13 +287,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         # Query moderated counts and recent moderated postings from SQLite.
         mod_counts = {}
+        mod_last = {}
         recent_moderated = []
         try:
             conn = sqlite3.connect(db_path)
             for row in conn.execute(
-                "SELECT article_url, COUNT(*) FROM moderated_postings GROUP BY article_url"
+                "SELECT article_url, COUNT(*), MAX(moderated_at) FROM moderated_postings GROUP BY article_url"
             ):
                 mod_counts[row[0]] = row[1]
+                mod_last[row[0]] = row[2] or ""
             for row in conn.execute(
                 "SELECT article_url, posting_id, author, title, text, created_at, moderated_at, is_reply, upvotes, downvotes"
                 " FROM moderated_postings ORDER BY moderated_at DESC LIMIT 100"
@@ -324,17 +326,34 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     age = f"{delta // 3600}h {(delta % 3600) // 60}m ago"
             else:
                 age = "\u2014"
-            rows.append((url, title, postings, moderated, age))
+            last_mod = mod_last.get(url, "")
+            rows.append((url, title, postings, moderated, age, last_mod))
 
-        rows.sort(key=lambda r: r[3], reverse=True)
+        rows.sort(key=lambda r: r[5], reverse=True)
+
+        def _relative_time(iso_str):
+            try:
+                dt = datetime.fromisoformat(iso_str)
+                delta = int((now - dt).total_seconds())
+                if delta < 60:
+                    return f"{delta}s ago"
+                elif delta < 3600:
+                    return f"{delta // 60}m ago"
+                else:
+                    return f"{delta // 3600}h {(delta % 3600) // 60}m ago"
+            except (ValueError, TypeError):
+                return "\u2014"
 
         table_rows = ""
-        for url, title, postings, moderated, age in rows:
+        for url, title, postings, moderated, age, last_mod in rows:
             label = html_mod.escape(title) if title else url
             detail_url = f"/article?url={urllib.parse.quote(url, safe='')}"
+            last_mod_age = _relative_time(last_mod) if last_mod else "\u2014"
             table_rows += (
                 f"<tr><td><a href=\"{detail_url}\">{label}</a></td>"
-                f"<td>{postings}</td><td>{moderated}</td><td>{age}</td></tr>\n"
+                f"<td>{postings}</td><td>{moderated}</td>"
+                f"<td data-sort=\"{last_mod}\">{last_mod_age}</td>"
+                f"<td>{age}</td></tr>\n"
             )
 
         recent_rows = ""
@@ -343,18 +362,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             safe_title = html_mod.escape(title or "")
             safe_text = html_mod.escape(text or "")
             art_label = html_mod.escape(url_titles.get(art_url, "")) or art_url
-            # Show moderated_at as relative time
-            try:
-                mod_dt = datetime.fromisoformat(moderated_at)
-                delta = int((now - mod_dt).total_seconds())
-                if delta < 60:
-                    mod_age = f"{delta}s ago"
-                elif delta < 3600:
-                    mod_age = f"{delta // 60}m ago"
-                else:
-                    mod_age = f"{delta // 3600}h {(delta % 3600) // 60}m ago"
-            except (ValueError, TypeError):
-                mod_age = moderated_at or "\u2014"
+            mod_age = _relative_time(moderated_at)
             reply_marker = "yes" if is_reply else ""
             recent_rows += (
                 f"<tr><td>{safe_author}</td>"
@@ -363,7 +371,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 f"<td><a href=\"{art_url}\">{art_label}</a></td>"
                 f"<td>{reply_marker}</td>"
                 f"<td>+{upvotes}/&minus;{downvotes}</td>"
-                f"<td>{mod_age}</td></tr>\n"
+                f"<td data-sort=\"{moderated_at or ''}\">{mod_age}</td></tr>\n"
             )
 
         html = f"""<!doctype html>
@@ -372,26 +380,88 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 <meta http-equiv="refresh" content="60">
 <title>derStandard Moderation Dashboard</title>
 <style>
-  body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #f8f8f8; }}
-  h1 {{ font-size: 1.3rem; }}
-  table {{ border-collapse: collapse; width: 100%; background: #fff; }}
-  th, td {{ text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #ddd; }}
-  th {{ background: #333; color: #fff; }}
-  a {{ color: #0366d6; }}
-  .meta {{ color: #666; font-size: .85rem; margin-bottom: 1rem; }}
-  h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
-  .truncate {{ max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 1.5rem 2rem; background: #f5f6f8; color: #1a1a1a; }}
+  h1 {{ font-size: 1.3rem; margin: 0 0 .25rem; }}
+  h2 {{ font-size: 1.1rem; margin: 2rem 0 .75rem; }}
+  .meta {{ color: #666; font-size: .85rem; margin-bottom: 1.25rem; }}
+  a {{ color: #0366d6; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .table-wrap {{ overflow-x: auto; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: .5rem; }}
+  table {{ border-collapse: collapse; width: 100%; background: #fff; font-size: .9rem; }}
+  th, td {{ text-align: left; padding: .6rem .85rem; border-bottom: 1px solid #eee; white-space: nowrap; }}
+  th {{ background: #1e293b; color: #e2e8f0; font-weight: 600; position: sticky; top: 0; cursor: pointer; user-select: none; }}
+  th:hover {{ background: #334155; }}
+  th .arrow {{ font-size: .7rem; margin-left: .3rem; opacity: .5; }}
+  th.sorted .arrow {{ opacity: 1; }}
+  tbody tr:nth-child(even) {{ background: #f9fafb; }}
+  tbody tr:hover {{ background: #eef2ff; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .truncate {{ max-width: 350px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 </style>
 </head><body>
 <h1>derStandard Moderation Dashboard</h1>
-<p class="meta">Monitoring {len(forums)} forum(s) &middot; page refreshes every 60 s &middot; <a href="/sql">SQL</a></p>
-<table>
-<tr><th>Article</th><th>Postings</th><th>Moderated</th><th>Last Activity</th></tr>
-{table_rows}</table>
+<p class="meta">Monitoring {len(forums)} forum(s) &middot; refreshes every 60s &middot; <a href="/sql">SQL</a></p>
+
+<div class="table-wrap">
+<table class="sortable" id="articles">
+<thead><tr>
+  <th>Article <span class="arrow">&varr;</span></th>
+  <th>Postings <span class="arrow">&varr;</span></th>
+  <th>Filtered <span class="arrow">&varr;</span></th>
+  <th class="sorted">Last Filtered <span class="arrow">&darr;</span></th>
+  <th>Last Activity <span class="arrow">&varr;</span></th>
+</tr></thead>
+<tbody>{table_rows}</tbody>
+</table>
+</div>
+
 <h2>Last 100 Filtered Posts</h2>
-<table>
-<tr><th>Author</th><th>Title</th><th>Text</th><th>Article</th><th>Reply</th><th>Votes</th><th>Filtered</th></tr>
-{recent_rows}</table>
+<div class="table-wrap">
+<table class="sortable" id="recent">
+<thead><tr>
+  <th>Author <span class="arrow">&varr;</span></th>
+  <th>Title <span class="arrow">&varr;</span></th>
+  <th>Text <span class="arrow">&varr;</span></th>
+  <th>Article <span class="arrow">&varr;</span></th>
+  <th>Reply <span class="arrow">&varr;</span></th>
+  <th>Votes <span class="arrow">&varr;</span></th>
+  <th class="sorted">Filtered <span class="arrow">&darr;</span></th>
+</tr></thead>
+<tbody>{recent_rows}</tbody>
+</table>
+</div>
+
+<script>
+document.querySelectorAll('table.sortable').forEach(table => {{
+  const headers = table.querySelectorAll('th');
+  let currentCol = -1, ascending = false;
+  // Find initially sorted column
+  headers.forEach((th, i) => {{ if (th.classList.contains('sorted')) currentCol = i; }});
+
+  headers.forEach((th, colIdx) => {{
+    th.addEventListener('click', () => {{
+      if (currentCol === colIdx) {{ ascending = !ascending; }}
+      else {{ ascending = true; currentCol = colIdx; }}
+      headers.forEach(h => {{ h.classList.remove('sorted'); h.querySelector('.arrow').innerHTML = '&varr;'; }});
+      th.classList.add('sorted');
+      th.querySelector('.arrow').innerHTML = ascending ? '&uarr;' : '&darr;';
+
+      const tbody = table.querySelector('tbody');
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      rows.sort((a, b) => {{
+        const cellA = a.children[colIdx], cellB = b.children[colIdx];
+        let va = cellA.dataset.sort !== undefined ? cellA.dataset.sort : cellA.textContent.trim();
+        let vb = cellB.dataset.sort !== undefined ? cellB.dataset.sort : cellB.textContent.trim();
+        const na = parseFloat(va), nb = parseFloat(vb);
+        if (!isNaN(na) && !isNaN(nb)) return ascending ? na - nb : nb - na;
+        return ascending ? va.localeCompare(vb) : vb.localeCompare(va);
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+    }});
+  }});
+}});
+</script>
 </body></html>"""
 
         self._send_html(html)
